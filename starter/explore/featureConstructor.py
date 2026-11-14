@@ -2,7 +2,12 @@ import numpy as np
 import pandas as pd
 from coviewFeatures import extract_coview_features_from_events
 import userFeatures
-import userItemFeatures
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
 
 def merge(dict1: dict, dict2: dict) -> dict:
@@ -48,7 +53,6 @@ class FeatureConstructor:
         out_of_stock=None,
         use_coview_features: bool = True,
         use_user_features: bool = True,
-        use_user_item_features: bool = True,
         use_session_features: bool = True,
         use_cross_features: bool = True,
     ):
@@ -63,7 +67,6 @@ class FeatureConstructor:
         # Feature group toggles
         self.use_coview_features = use_coview_features
         self.use_user_features = use_user_features
-        self.use_user_item_features = use_user_item_features
         self.use_session_features = use_session_features
         self.use_cross_features = use_cross_features
 
@@ -107,7 +110,6 @@ class FeatureConstructor:
         data: dict,
         use_coview_features: bool = None,
         use_user_features: bool = None,
-        use_user_item_features: bool = None,
         use_session_features: bool = None,
         use_cross_features: bool = None,
     ) -> dict:
@@ -117,7 +119,6 @@ class FeatureConstructor:
         """
         coview_on = self.use_coview_features if use_coview_features is None else use_coview_features
         user_on = self.use_user_features if use_user_features is None else use_user_features
-        user_item_on = self.use_user_item_features if use_user_item_features is None else use_user_item_features
         session_on = self.use_session_features if use_session_features is None else use_session_features
         cross_on = self.use_cross_features if use_cross_features is None else use_cross_features
 
@@ -143,22 +144,10 @@ class FeatureConstructor:
 
         coview_dict = data.get("coview_dict") or self.coview_dict
 
-        # 1. Fetch external user & user-item features (if enabled)
+        # 1. Fetch external user features (if enabled)
         user_data = {}
         if user_on:
             user_data = userFeatures.user_features(user_id, ts_raw) or {}
-
-        user_item_data = {}
-        if user_item_on:
-            try:
-                user_item_data = userItemFeatures.user_item_features(user_id, product_id) or {}
-            except TypeError:
-                raw_ui = userItemFeatures.user_item_features(user_id) or {}
-                user_item_data = (
-                    raw_ui.get(product_id, {})
-                    if isinstance(raw_ui, dict) and product_id in raw_ui
-                    else raw_ui
-                )
 
         # 2. Parse timestamps into numeric GBM features
         req_ts = pd.to_datetime(ts_raw, errors="coerce")
@@ -251,8 +240,6 @@ class FeatureConstructor:
             )
         if user_on:
             X = merge(X, user_data)
-        if user_item_on:
-            X = merge(X, user_item_data)
 
         # 7. Cross-features combining user history with current candidate item (if enabled)
         if cross_on and user_on:
@@ -278,12 +265,13 @@ class FeatureConstructor:
         cast_categoricals: bool = True,
         use_coview_features: bool = None,
         use_user_features: bool = None,
-        use_user_item_features: bool = None,
         use_session_features: bool = None,
         use_cross_features: bool = None,
+        show_progress: bool = True,
     ):
         """
         Generates (X, y_click, y_buy, sample_weights) training pairs from session logs.
+        Optimized to compute user and session features once per session instead of per item.
         """
         if not self._initialized:
             self.init_dependencies(
@@ -294,87 +282,172 @@ class FeatureConstructor:
                 out_of_stock,
             )
 
+        coview_on = self.use_coview_features if use_coview_features is None else use_coview_features
+        user_on = self.use_user_features if use_user_features is None else use_user_features
+        session_on = self.use_session_features if use_session_features is None else use_session_features
+        cross_on = self.use_cross_features if use_cross_features is None else use_cross_features
+
         active_coview_dict = coview_dict if coview_dict is not None else self.coview_dict
 
         ref_sessions = history_sessions if history_sessions is not None else interactions_df
         first_seen_ts = ref_sessions.groupby("user_id")["ts"].min().to_dict()
 
+        # Pre-parse timestamps once in vectorized Pandas instead of per-row
+        parsed_ts = pd.to_datetime(interactions_df["ts"], errors="coerce")
+        hours = parsed_ts.dt.hour.fillna(-1).astype(int).tolist()
+        dows = parsed_ts.dt.dayofweek.fillna(-1).astype(int).tolist()
+
+        # Pre-parse catalog created_at once
+        created_at_map = {}
+        if self.catalog is not None and "created_at" in self.catalog.columns:
+            cat_idx = self.catalog.set_index("product_id") if "product_id" in self.catalog.columns else self.catalog
+            created_at_map = pd.to_datetime(cat_idx["created_at"], errors="coerce").to_dict()
+
+        user_cache = {}
         X_rows = []
         y_click = []
         y_buy = []
         sample_weights = []
 
-        for row in interactions_df.itertuples():
+        iterator = tqdm(
+            zip(interactions_df.itertuples(), parsed_ts, hours, dows),
+            total=len(interactions_df),
+            desc="Generating features",
+            disable=not show_progress,
+        )
+
+        for row, req_ts, hour_of_day, day_of_week in iterator:
             shown_items = getattr(row, "shown", None)
             if not isinstance(shown_items, (list, tuple, np.ndarray)) or len(shown_items) == 0:
                 continue
 
             propensities = getattr(row, "propensity", None)
-            if (
-                not isinstance(propensities, (list, tuple, np.ndarray))
-                or len(propensities) != len(shown_items)
-            ):
+            if not isinstance(propensities, (list, tuple, np.ndarray)) or len(propensities) != len(shown_items):
                 propensities = [1.0] * len(shown_items)
 
-            is_new_user = row.ts <= first_seen_ts.get(row.user_id, row.ts)
+            user_id = row.user_id
+            ts_raw = row.ts
+            is_new_user = int(ts_raw <= first_seen_ts.get(user_id, ts_raw))
+            is_weekend = int(day_of_week in (5, 6)) if day_of_week != -1 else 0
+
+            # 1. Fetch user features ONCE per (user_id, ts) instead of once per shown item
+            user_data = {}
+            user_avg_price = None
+            if user_on:
+                cache_key = (user_id, ts_raw)
+                if cache_key not in user_cache:
+                    user_cache[cache_key] = userFeatures.user_features(user_id, ts_raw) or {}
+                user_data = user_cache[cache_key]
+                if cross_on:
+                    user_avg_price = user_data.get("avg_price_eur") or user_data.get("user_avg_price")
+
+            # 2. Extract context & recent_views ONCE per session
+            context = getattr(row, "context", None)
+            if isinstance(context, dict):
+                device, region, page = context.get("device"), context.get("region"), context.get("page")
+            elif context is not None:
+                device = getattr(context, "device", None)
+                region = getattr(context, "region", None)
+                page = getattr(context, "page", None)
+            else:
+                device = region = page = None
+
             recent_views = getattr(row, "recent_views", None)
             if isinstance(recent_views, np.ndarray):
                 recent_views = recent_views.tolist()
             elif not isinstance(recent_views, list):
                 recent_views = []
 
+            session_length = len(recent_views)
+            last_meta = None
+            if session_on and session_length > 0 and self.catalog_lookup:
+                last_event = recent_views[-1]
+                last_viewed_id = last_event.get("product_id") if isinstance(last_event, dict) else last_event
+                last_meta = self.catalog_lookup.get(last_viewed_id)
+
+            clicked_val = getattr(row, "clicked", None)
+            purchased_val = getattr(row, "purchased", None)
+
+            # 3. Inner loop now only computes item-specific features
             for prod_id, prop in zip(shown_items, propensities):
                 prod_meta = self.catalog_lookup.get(prod_id)
                 if prod_meta is None:
                     continue
 
-                payload = {
-                    "product_id": prod_id,
+                created_ts = created_at_map.get(prod_id)
+                product_age_days = (
+                    max((req_ts - created_ts).total_seconds() / 86400.0, 0.0)
+                    if pd.notna(req_ts) and pd.notna(created_ts)
+                    else -1.0
+                )
+
+                description = prod_meta.get("description") or ""
+                price_eur = float(prod_meta.get("price_eur") or 0.0)
+
+                X = {
                     "brand": prod_meta.get("brand"),
                     "category": prod_meta.get("category"),
-                    "created_at": prod_meta.get("created_at"),
-                    "description": prod_meta.get("description"),
-                    "is_active": prod_meta.get("is_active"),
-                    "price_eur": prod_meta.get("price_eur"),
                     "subcategory": prod_meta.get("subcategory"),
-                    "ts": row.ts,
-                    "user_id": row.user_id,
+                    "device": device,
+                    "region": region,
+                    "page": page,
+                    "is_active": int(bool(prod_meta.get("is_active"))),
+                    "price_eur": price_eur,
+                    "product_age_days": product_age_days,
+                    "description_len": len(description),
+                    "is_bestseller": int(prod_id in self.best_sellers_set),
+                    "is_out_of_stock": int(prod_id in self.out_of_stock_set),
                     "is_new_user": is_new_user,
-                    "context": getattr(row, "context", None),
-                    "recent_views": recent_views,
-                    "coview_dict": active_coview_dict,
-                    "query_function": self.query_function,
-                    "catalog": self.catalog,
+                    "hour_of_day": hour_of_day,
+                    "day_of_week": day_of_week,
+                    "is_weekend": is_weekend,
                 }
 
-                X_rows.append(
-                    self.constructFeatures(
-                        payload,
-                        use_coview_features=use_coview_features,
-                        use_user_features=use_user_features,
-                        use_user_item_features=use_user_item_features,
-                        use_session_features=use_session_features,
-                        use_cross_features=use_cross_features,
-                    )
-                )
-                y_click.append(_is_match(prod_id, getattr(row, "clicked", None)))
-                y_buy.append(_is_match(prod_id, getattr(row, "purchased", None)))
+                if session_on:
+                    if last_meta:
+                        same_cat = int(prod_meta.get("category") == last_meta.get("category"))
+                        same_brand = int(prod_meta.get("brand") == last_meta.get("brand"))
+                        price_diff = (
+                            price_eur - float(last_meta["price_eur"])
+                            if prod_meta.get("price_eur") is not None and last_meta.get("price_eur") is not None
+                            else 0.0
+                        )
+                    else:
+                        same_cat, same_brand, price_diff = 0, 0, 0.0
 
-                prop_val = (
-                    float(prop)
-                    if prop is not None and pd.notna(prop)
-                    else 1.0
-                )
+                    X["session_length"] = session_length
+                    X["same_category_as_last_view"] = same_cat
+                    X["same_brand_as_last_view"] = same_brand
+                    X["price_diff_from_last_view"] = price_diff
+
+                if coview_on:
+                    X.update(extract_coview_features_from_events(prod_id, recent_views, active_coview_dict))
+                if user_on:
+                    X.update(user_data)
+
+                if cross_on and user_on:
+                    if user_avg_price and user_avg_price > 0:
+                        X["price_ratio_to_user_avg"] = price_eur / float(user_avg_price)
+                        X["price_diff_from_user_avg"] = price_eur - float(user_avg_price)
+                    else:
+                        X["price_ratio_to_user_avg"] = 1.0
+                        X["price_diff_from_user_avg"] = 0.0
+
+                X_rows.append(X)
+                y_click.append(_is_match(prod_id, clicked_val))
+                y_buy.append(_is_match(prod_id, purchased_val))
+
+                prop_val = float(prop) if prop is not None and pd.notna(prop) else 1.0
                 sample_weights.append(1.0 / max(prop_val, 0.01))
 
-        X = pd.DataFrame(X_rows)
-        if cast_categoricals and not X.empty:
+        X_df = pd.DataFrame(X_rows)
+        if cast_categoricals and not X_df.empty:
             for col in self.CATEGORICAL_COLS:
-                if col in X.columns:
-                    X[col] = X[col].astype("category")
+                if col in X_df.columns:
+                    X_df[col] = X_df[col].astype("category")
 
         return (
-            X,
+            X_df,
             np.array(y_click, dtype=np.int32),
             np.array(y_buy, dtype=np.int32),
             np.array(sample_weights, dtype=np.float32),
@@ -389,143 +462,5 @@ def constructFeatures(data: dict, **kwargs) -> dict:
     return _default_constructor.constructFeatures(data, **kwargs)
 
 
-def generate_xy(
-        self,
-        interactions_df: pd.DataFrame,
-        coview_dict: dict = None,
-        history_sessions: pd.DataFrame = None,
-        query_function=None,
-        catalog: pd.DataFrame = None,
-        best_sellers=None,
-        out_of_stock=None,
-        cast_categoricals: bool = True,
-        max_examples: int = None,
-        random_state: int = None,
-        use_coview_features: bool = None,
-        use_user_features: bool = None,
-        use_user_item_features: bool = None,
-        use_session_features: bool = None,
-        use_cross_features: bool = None,
-    ):
-        """
-        Generates (X, y_click, y_buy, sample_weights) training pairs from session logs.
-        
-        Args:
-            max_examples: Max number of (X, Y) candidate rows to generate (None = all).
-            random_state: If set, shuffles sessions before sampling so examples span all timestamps.
-        """
-        if max_examples is not None and max_examples <= 0:
-            return (
-                pd.DataFrame(),
-                np.array([], dtype=np.int32),
-                np.array([], dtype=np.int32),
-                np.array([], dtype=np.float32),
-            )
-
-        if not self._initialized:
-            self.init_dependencies(
-                query_function or self.query_function,
-                catalog if catalog is not None else self.catalog,
-                coview_dict or self.coview_dict,
-                best_sellers,
-                out_of_stock,
-            )
-
-        active_coview_dict = coview_dict if coview_dict is not None else self.coview_dict
-
-        # Compute first interaction timestamp per user BEFORE any shuffling/slicing
-        ref_sessions = history_sessions if history_sessions is not None else interactions_df
-        first_seen_ts = ref_sessions.groupby("user_id")["ts"].min().to_dict()
-
-        df_to_iter = (
-            interactions_df.sample(frac=1.0, random_state=random_state)
-            if random_state is not None
-            else interactions_df
-        )
-
-        X_rows = []
-        y_click = []
-        y_buy = []
-        sample_weights = []
-
-        for row in df_to_iter.itertuples():
-            if max_examples is not None and len(X_rows) >= max_examples:
-                break
-
-            shown_items = getattr(row, "shown", None)
-            if not isinstance(shown_items, (list, tuple, np.ndarray)) or len(shown_items) == 0:
-                continue
-
-            propensities = getattr(row, "propensity", None)
-            if (
-                not isinstance(propensities, (list, tuple, np.ndarray))
-                or len(propensities) != len(shown_items)
-            ):
-                propensities = [1.0] * len(shown_items)
-
-            is_new_user = row.ts <= first_seen_ts.get(row.user_id, row.ts)
-            recent_views = getattr(row, "recent_views", None)
-            if isinstance(recent_views, np.ndarray):
-                recent_views = recent_views.tolist()
-            elif not isinstance(recent_views, list):
-                recent_views = []
-
-            for prod_id, prop in zip(shown_items, propensities):
-                if max_examples is not None and len(X_rows) >= max_examples:
-                    break
-
-                prod_meta = self.catalog_lookup.get(prod_id)
-                if prod_meta is None:
-                    continue
-
-                payload = {
-                    "product_id": prod_id,
-                    "brand": prod_meta.get("brand"),
-                    "category": prod_meta.get("category"),
-                    "created_at": prod_meta.get("created_at"),
-                    "description": prod_meta.get("description"),
-                    "is_active": prod_meta.get("is_active"),
-                    "price_eur": prod_meta.get("price_eur"),
-                    "subcategory": prod_meta.get("subcategory"),
-                    "ts": row.ts,
-                    "user_id": row.user_id,
-                    "is_new_user": is_new_user,
-                    "context": getattr(row, "context", None),
-                    "recent_views": recent_views,
-                    "coview_dict": active_coview_dict,
-                    "query_function": self.query_function,
-                    "catalog": self.catalog,
-                }
-
-                X_rows.append(
-                    self.constructFeatures(
-                        payload,
-                        use_coview_features=use_coview_features,
-                        use_user_features=use_user_features,
-                        use_user_item_features=use_user_item_features,
-                        use_session_features=use_session_features,
-                        use_cross_features=use_cross_features,
-                    )
-                )
-                y_click.append(_is_match(prod_id, getattr(row, "clicked", None)))
-                y_buy.append(_is_match(prod_id, getattr(row, "purchased", None)))
-
-                prop_val = (
-                    float(prop)
-                    if prop is not None and pd.notna(prop)
-                    else 1.0
-                )
-                sample_weights.append(1.0 / max(prop_val, 0.01))
-
-        X = pd.DataFrame(X_rows)
-        if cast_categoricals and not X.empty:
-            for col in self.CATEGORICAL_COLS:
-                if col in X.columns:
-                    X[col] = X[col].astype("category")
-
-        return (
-            X,
-            np.array(y_click, dtype=np.int32),
-            np.array(y_buy, dtype=np.int32),
-            np.array(sample_weights, dtype=np.float32),
-        )
+def generate_xy(*args, **kwargs):
+    return _default_constructor.generate_xy(*args, **kwargs)

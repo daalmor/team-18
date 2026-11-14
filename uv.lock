@@ -396,6 +396,7 @@ dependencies = [
     { name = "pandas" },
     { name = "requests" },
     { name = "scipy" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -407,6 +408,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.1.1" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "scipy", specifier = ">=1.18.1" },
+    { name = "tqdm", specifier = ">=4.70.1" },
 ]
 
 [[package]]
