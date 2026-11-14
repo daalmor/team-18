@@ -13,6 +13,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
+import lightgbm as lgb
 
 import requests
 
@@ -23,6 +24,9 @@ API = os.environ.get("RAWTREE_API_URL", "https://api.rawtree.com")
 TEAM = os.environ["TEAM_ID"]
 http = requests.Session()
 http.headers["Authorization"] = f"Bearer {os.environ['RAWTREE_API_KEY']}"
+
+model = lgb.Booster(model_file="starter/model.txt")
+
 
 SALES = """
 SELECT product_id, count() AS n
