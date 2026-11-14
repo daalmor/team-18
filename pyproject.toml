@@ -10,6 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "implicit>=0.7.3",
     "jupyter>=1.1.1",
+    "lightgbm>=4.7.0",
     "numpy>=2.5.4",
     "pandas>=3.1.1",
     "requests>=2.34.2",
