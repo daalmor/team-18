@@ -4,6 +4,12 @@ import re
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
 # configuracion
 EVW = {"view": 1, "add_to_cart": 3, "purchase": 6}   # peso de cada tipo de evento
 HALF_LIFE_DAYS = 14                                  # vida media del peso por recencia (gustos)
@@ -44,17 +50,61 @@ def _ctx(c):
 
 
 def _has(s):
-    """True donde la columna (clicked / purchased) trae un producto de verdad."""
-    return ~s.astype(str).isin(["", "None", "nan", "NaN", "NULL", "null", "<NA>"])
+    """True donde clicked / purchased trae un product_id de verdad (los ids son del tipo p_xxxxxx)."""
+    return s.astype(str).str.contains(r"p_[0-9a-fA-F]{4,}", regex=True)
 
 
 # 1) historial del usuario
+_HIST = {"ev": {}, "ss": {}, "users": set(), "t_max": None}   # cache en memoria (ver prefetch)
+_EV_COLS = ["session_id", "event_type", "product_id", "ts"]
+_SS_COLS = ["request_id", "ts", "context", "clicked", "purchased"]
+
+
+def prefetch(user_ids, ts_max, chunk=300, show_progress=True):
+    """Descarga de golpe el historial (anterior a ts_max) de muchos usuarios y lo guarda en memoria.
+    Despues, fetch_user_history() lo lee de aqui sin tocar RawTree: 2 consultas por lote de usuarios
+    en vez de 2 por peticion."""
+    assert _query is not None, "Llama primero a userFeatures.init(query, catalog)"
+    ok = lambda x: re.fullmatch(r"[A-Za-z0-9_\-]+", str(x))
+    users = sorted({str(x) for x in user_ids if ok(x)} - _HIST["users"])
+    t = _ts(ts_max).strftime("%Y-%m-%d %H:%M:%S.%f")
+    starts = tqdm(range(0, len(users), chunk), desc=f"Descargando historial ({len(users)} usuarios)",
+                  unit="lote", disable=not show_progress)
+    for i in starts:
+        ids = ",".join(f"'{x}'" for x in users[i:i + chunk])
+        ev = _query(f"""
+            SELECT user_id::String AS user_id, session_id::String AS session_id, event_type::String AS event_type,
+                   product_id::String AS product_id, ts::String AS ts
+            FROM shop.history_events WHERE user_id::String IN ({ids}) AND ts::String < '{t}'""")
+        ss = _query(f"""
+            SELECT user_id::String AS user_id, request_id::String AS request_id, ts::String AS ts,
+                   context, clicked, purchased
+            FROM shop.history_sessions WHERE user_id::String IN ({ids}) AND ts::String < '{t}'""")
+        for df, key in ((ev, "ev"), (ss, "ss")):
+            if len(df):
+                df["ts"] = pd.to_datetime(df["ts"])
+                for uid, g in df.groupby("user_id"):
+                    _HIST[key][uid] = g.drop(columns="user_id")
+    _HIST["users"].update(users)
+    prev = _HIST["t_max"]
+    _HIST["t_max"] = _ts(ts_max) if prev is None else max(prev, _ts(ts_max))
+
+
+def clear_prefetch():
+    _HIST.update(ev={}, ss={}, users=set(), t_max=None)
+
+
 def fetch_user_history(user_id, ts):
-    """Trae de RawTree los eventos y las sesiones del usuario anteriores a ts."""
+    """Eventos y sesiones del usuario anteriores a ts (de la cache si se hizo prefetch, si no de RawTree)."""
     assert _query is not None, "Llama primero a features.init(query, catalog)"
     uid = str(user_id)
     assert re.fullmatch(r"[A-Za-z0-9_\-]+", uid), f"user_id raro: {uid}"
-    t = _ts(ts).strftime("%Y-%m-%d %H:%M:%S.%f")
+    t = _ts(ts)
+    if uid in _HIST["users"] and _HIST["t_max"] is not None and t <= _HIST["t_max"]:
+        ev = _HIST["ev"].get(uid, pd.DataFrame(columns=_EV_COLS))
+        ss = _HIST["ss"].get(uid, pd.DataFrame(columns=_SS_COLS))
+        return ev[ev["ts"] < t], ss[ss["ts"] < t]
+    t = t.strftime("%Y-%m-%d %H:%M:%S.%f")
     ev = _query(f"""
         SELECT session_id::String AS session_id, event_type::String AS event_type,
                product_id::String AS product_id, ts::String AS ts

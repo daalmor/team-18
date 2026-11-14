@@ -60,7 +60,7 @@ for i in range(num_batches):
             sum(
                 CASE 
                     WHEN event_type = 'view' THEN 1
-                    WHEN event_type = 'cart' THEN 3
+                    WHEN event_type = 'add_to_cart' THEN 3
                     WHEN event_type = 'purchase' THEN 5
                     ELSE 1
                 END
@@ -120,11 +120,15 @@ print(
 model = AlternatingLeastSquares(
     factors=32, regularization=0.1, iterations=15, random_state=42
 )
-model.fit(user_item_matrix.T.tocsr())
+import implicit
+_major_minor = tuple(int(x) for x in implicit.__version__.split(".")[:2])
+model.fit(user_item_matrix if _major_minor >= (0, 5) else user_item_matrix.T.tocsr())
 
 # 5. Extract Frozen Embeddings
 user_embeddings = model.user_factors  # Shape: (Num_Users, 32)
 item_embeddings = model.item_factors  # Shape: (Num_Products, 32)
+assert user_embeddings.shape[0] == len(user_ids) and item_embeddings.shape[0] == len(product_ids), (
+    f"Formas intercambiadas: user_factors{user_embeddings.shape} vs {len(user_ids)} usuarios")
 
 print("iALS model trained successfully! Frozen embeddings are ready for Stage 1.")
 import os
