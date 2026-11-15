@@ -13,6 +13,7 @@ import queue
 import sys
 import threading
 import time
+import zlib
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,18 +28,36 @@ from requests.adapters import HTTPAdapter
 import userFeatures
 from coviewFeatures import extract_coview_features_from_events
 from featureConstructor import FeatureConstructor, _cross_features, _last_viewed_id
+from popularity import load_popularity
 
 # ---------------- knobs ----------------
 WORKERS = 6              # parallel answers (LightGBM predict runs with 1 thread each)
 BUDGET_S = 2.25          # max seconds for user features + frame + scoring of ONE request (then: co-view fallback)
 START_MAX_AGE_S = 2.5    # don't start a request older than this: it would miss the shop's deadline (seen >= 3.4 s)
-N_CV, N_TOTAL = 5000, 500   # candidates per request: co-views first, padded with best sellers
+N_CV, N_TOTAL = 40, 80   # candidates per request: up to 40 co-views, then the best in-stock sellers up to 80 in total
 POLL_SLEEP_S = 0.05
-LOG_EVERY_S = 2
+LOG_EVERY_S = 15
 PUSH_RETRIES = 1
 WARM_USERS = 5000        # history cache warm-up: most recent distinct users in shop.requests
 WARM_CHUNK = 500
 WARM_MAX_S = 240
+BUY_WEIGHT = 10.0        # rank by p_click + BUY_WEIGHT * p_buy (offline: best top-3 for both clicks and buys at 10)
+# Users WITHOUT history (new, anonymous or not cached yet) are split between these strategies by request_id, so the
+# feedback table tells us which works best: "lgbm" = the model with no-history features, "cv" = co-view order
+# (then best sellers), "pop" = best sellers. Use ("lgbm",) to switch the test off.
+NOHIST_ARMS = ("lgbm", "cv", "pop")
+
+# Strategy for ALL requests, chosen on the command line:  python recommender_v4.py --mode cv
+#   lgbm  (default) the model; users without history go through NOHIST_ARMS
+#   cv    co-view order for everyone: no model, no user history, very fast (label "cv_all")
+#   split 50/50 by request_id between the model and co-view order, for EVERY user: a fair live comparison
+#         (labels "ab_model" vs "ab_cv": the leaderboard rows compare them directly)
+MODE = "lgbm"
+for _i, _a in enumerate(sys.argv):
+    if _a == "--mode" and _i + 1 < len(sys.argv):
+        MODE = sys.argv[_i + 1]
+if MODE not in ("lgbm", "cv", "split"):
+    raise SystemExit(f"--mode must be lgbm, cv or split (got {MODE!r})")
 
 for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
     key, _, value = line.partition("=")
@@ -88,6 +107,9 @@ print(f"[startup] Starting recommender for team '{TEAM}' -> {API}", flush=True)
 
 print("[startup] Loading LightGBM model and schema...", flush=True)
 model = lgb.Booster(model_file="starter/model.txt")
+MODEL_BUY_PATH = "starter/model_buy.txt"
+model_buy = lgb.Booster(model_file=MODEL_BUY_PATH) if Path(MODEL_BUY_PATH).exists() else None
+print(f"[startup] Purchase model: {'loaded (blend weight %.1f)' % BUY_WEIGHT if model_buy else 'NOT found, ranking by clicks only'}", flush=True)
 schema = pickle.load(open("starter/schema.pkl", "rb"))
 print(f"[startup] Model & schema loaded ({time.time() - t0:.1f}s)", flush=True)
 
@@ -111,6 +133,21 @@ fc.column_dtypes = schema["column_dtypes"]
 fc.category_dtypes = schema["category_dtypes"]
 
 CREATED = pd.to_datetime(catalog.set_index("product_id")["created_at"], errors="coerce").to_dict()
+
+# Popularity features (only if the model was trained with them): precomputed by the notebook, else computed now.
+POP_PATH = "starter/popularity.pkl"
+POP_COLS_IN_MODEL = [c for c in schema["feature_columns"] if c.startswith("pop_")]
+if POP_COLS_IN_MODEL:
+    t_step = time.time()
+    if Path(POP_PATH).exists():
+        fc.pop_lookup = pickle.load(open(POP_PATH, "rb"))
+    else:
+        print("[startup] No popularity.pkl: computing popularity from RawTree (may take a minute)...", flush=True)
+        fc.pop_lookup = load_popularity(lambda sql: pd.DataFrame(query(sql, timeout=600)))
+    missing_pop = [c for c in POP_COLS_IN_MODEL if c not in fc._pop(None)]
+    if missing_pop:
+        raise RuntimeError(f"model expects popularity columns we cannot compute: {missing_pop}")
+    print(f"[startup] Popularity loaded: {len(fc.pop_lookup) - 1} products ({time.time() - t_step:.1f}s)", flush=True)
 
 # History is static, so the whole user-history cache is precomputed once (python starter/precompute.py).
 HISTORY_CACHE = "starter/history_cache.pkl"
@@ -370,6 +407,8 @@ def build_frame(cands: list[str], req: Record, deadline: float, user_data: dict 
         }
         X.update(extract_coview_features_from_events(p, rv, COVIEWS))
         X.update(user_data)
+        if POP_COLS_IN_MODEL:
+            X.update(fc._pop(p))
         X.update(_cross_features(user_data, m.get("category"), price))
         rows.append(X)
         kept.append(p)
@@ -388,21 +427,44 @@ def build_frame(cands: list[str], req: Record, deadline: float, user_data: dict 
 
 
 # ---------- answering (runs in worker threads) ----------
+def _arm(req: Record) -> str:
+    return NOHIST_ARMS[zlib.crc32(str(req["request_id"]).encode()) % len(NOHIST_ARMS)]
+
+
 def answer(req: Record, best: list[str], unavailable: set[str]) -> Record:
     t_start = time.time()
     deadline = t_start + BUDGET_S
     cands = candidates(req.get("recent_views") or [], best, unavailable)
     STATS.add_time("cands", time.time() - t_start)
+    if MODE == "cv" or (MODE == "split" and zlib.crc32(("ab:" + str(req["request_id"])).encode()) % 2 == 1):
+        items = cands[:10]                           # candidates() ranks co-views first, then best sellers
+        if len(items) < 10:
+            items += [p for p in best if p not in unavailable and p not in items][: 10 - len(items)]
+        return {"request_id": req["request_id"], "items": items,
+                "model_version": "cv_all" if MODE == "cv" else "ab_cv"}
     try:
         t = time.time()
         user_data, warm = user_data_for(req)
         STATS.add_time("user_feat", time.time() - t)
-        version = "lgbm_v1" if warm else "lgbm_cold"
+        if MODE == "split":
+            version = "ab_model"                     # the model for everyone, with or without history
+        elif warm and float(user_data.get("is_new_user", 0)) < 0.5:
+            version = "lgbm_v1"                      # user with real history
+        else:
+            arm = _arm(req)
+            version = f"nohist_{arm}"
+            if arm == "cv":                          # candidates() already ranks co-views first, then best sellers
+                return {"request_id": req["request_id"], "items": cands[:10], "model_version": version}
+            if arm == "pop":
+                return {"request_id": req["request_id"],
+                        "items": [p for p in best if p not in unavailable][:10], "model_version": version}
         t = time.time()
         X, kept = build_frame(cands, req, deadline, user_data)
         STATS.add_time("frame", time.time() - t)
         t = time.time()
         scores = model.predict(X, num_threads=1)     # 1 thread: several workers predict at once
+        if model_buy is not None:
+            scores = scores + BUY_WEIGHT * model_buy.predict(X, num_threads=1)
         STATS.add_time("model", time.time() - t)
         items = [kept[i] for i in np.argsort(-scores)[:10]]
         items += [p for p in cands if p not in items][: 10 - len(items)]   # safety pad
@@ -475,8 +537,10 @@ def main() -> None:
     except Exception as e:
         print(f"[warn] initial stock check failed: {e}", flush=True)
     threading.Thread(target=stock_loop, args=(state,), daemon=True).start()
-    threading.Thread(target=history_loop, daemon=True).start()
-    threading.Thread(target=warm_loop, daemon=True).start()
+    if MODE != "cv":                                 # cv mode never looks at user history
+        threading.Thread(target=history_loop, daemon=True).start()
+        threading.Thread(target=warm_loop, daemon=True).start()
+    print(f"[loop] MODE={MODE}", flush=True)
 
     pool = ThreadPoolExecutor(max_workers=WORKERS)
     seen = set[str]()

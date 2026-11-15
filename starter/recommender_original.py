@@ -1,15 +1,19 @@
-"""LightGBM recommender v3: poller -> worker pool. Newest first, skips requests already too old to count.
+"""LightGBM recommender v4: poller -> workers. User history comes from an in-memory cache that is warmed in the
+background; a cold user is answered right away with new-user defaults (and fetched for next time).
 
-    python starter/recommender_v3.py            # live loop
-    python starter/recommender_v3.py --check    # compares build_frame vs the old per-row path, no push
+    python starter/recommender_v4.py            # live loop
+    python starter/recommender_v4.py --check    # compares build_frame vs the old per-row path, no push
 """
 from __future__ import annotations
 
+import functools
 import os
 import pickle
+import queue
 import sys
 import threading
 import time
+import zlib
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,15 +28,24 @@ from requests.adapters import HTTPAdapter
 import userFeatures
 from coviewFeatures import extract_coview_features_from_events
 from featureConstructor import FeatureConstructor, _cross_features, _last_viewed_id
+from popularity import load_popularity
 
 # ---------------- knobs ----------------
-WORKERS = 6              # parallel answers (network + pandas; LightGBM predict runs with 1 thread each)
-BUDGET_S = 2.25          # max seconds building features + scoring ONE request (then: co-view fallback)
-START_MAX_AGE_S = 2.4    # don't start a request older than this: it would miss the shop's deadline (seen >= 3.4 s)
-N_CV, N_TOTAL = 2000, 500   # candidates per request: co-views first, padded with best sellers
+WORKERS = 6              # parallel answers (LightGBM predict runs with 1 thread each)
+BUDGET_S = 2.25          # max seconds for user features + frame + scoring of ONE request (then: co-view fallback)
+START_MAX_AGE_S = 2.5    # don't start a request older than this: it would miss the shop's deadline (seen >= 3.4 s)
+N_CV, N_TOTAL = 40, 80   # candidates per request: up to 40 co-views, then the best in-stock sellers up to 80 in total
 POLL_SLEEP_S = 0.05
-LOG_EVERY_S = 2
+LOG_EVERY_S = 15
 PUSH_RETRIES = 1
+WARM_USERS = 5000        # history cache warm-up: most recent distinct users in shop.requests
+WARM_CHUNK = 500
+WARM_MAX_S = 240
+BUY_WEIGHT = 10.0        # rank by p_click + BUY_WEIGHT * p_buy (offline: best top-3 for both clicks and buys at 10)
+# Users WITHOUT history (new, anonymous or not cached yet) are split between these strategies by request_id, so the
+# feedback table tells us which works best: "lgbm" = the model with no-history features, "cv" = co-view order
+# (then best sellers), "pop" = best sellers. Use ("lgbm",) to switch the test off.
+NOHIST_ARMS = ("lgbm", "cv", "pop")
 
 for line in Path(".env").read_text().splitlines() if Path(".env").exists() else []:
     key, _, value = line.partition("=")
@@ -41,7 +54,7 @@ API = os.environ.get("RAWTREE_API_URL", "https://api.rawtree.com")
 TEAM = os.environ["TEAM_ID"]
 http = requests.Session()
 http.headers["Authorization"] = f"Bearer {os.environ['RAWTREE_API_KEY']}"
-_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=WORKERS * 2 + 4)   # reuse connections across threads
+_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=WORKERS * 2 + 6)   # reuse connections across threads
 http.mount("https://", _adapter)
 http.mount("http://", _adapter)
 
@@ -55,6 +68,8 @@ OUT_OF_STOCK = """SELECT product_id::String AS product_id FROM shop.catalog_upda
 WHERE change::String IN ('out_of_stock', 'back_in_stock')
 GROUP BY product_id
 HAVING argMax(change::String, ts::DateTime64(3)) = 'out_of_stock'"""
+WARM_USERS_SQL = """SELECT user_id::String AS user_id, max(ts::String) AS last_ts
+FROM shop.requests GROUP BY user_id ORDER BY last_ts DESC LIMIT {n}"""
 COVIEWS_SQL = """
 SELECT a.product_id AS p, b.product_id AS q, count() AS n
 FROM (SELECT session_id::String AS session_id, product_id::String AS product_id FROM shop.history_events WHERE event_type = 'view') AS a
@@ -80,6 +95,9 @@ print(f"[startup] Starting recommender for team '{TEAM}' -> {API}", flush=True)
 
 print("[startup] Loading LightGBM model and schema...", flush=True)
 model = lgb.Booster(model_file="starter/model.txt")
+MODEL_BUY_PATH = "starter/model_buy.txt"
+model_buy = lgb.Booster(model_file=MODEL_BUY_PATH) if Path(MODEL_BUY_PATH).exists() else None
+print(f"[startup] Purchase model: {'loaded (blend weight %.1f)' % BUY_WEIGHT if model_buy else 'NOT found, ranking by clicks only'}", flush=True)
 schema = pickle.load(open("starter/schema.pkl", "rb"))
 print(f"[startup] Model & schema loaded ({time.time() - t0:.1f}s)", flush=True)
 
@@ -103,6 +121,34 @@ fc.column_dtypes = schema["column_dtypes"]
 fc.category_dtypes = schema["category_dtypes"]
 
 CREATED = pd.to_datetime(catalog.set_index("product_id")["created_at"], errors="coerce").to_dict()
+
+# Popularity features (only if the model was trained with them): precomputed by the notebook, else computed now.
+POP_PATH = "starter/popularity.pkl"
+POP_COLS_IN_MODEL = [c for c in schema["feature_columns"] if c.startswith("pop_")]
+if POP_COLS_IN_MODEL:
+    t_step = time.time()
+    if Path(POP_PATH).exists():
+        fc.pop_lookup = pickle.load(open(POP_PATH, "rb"))
+    else:
+        print("[startup] No popularity.pkl: computing popularity from RawTree (may take a minute)...", flush=True)
+        fc.pop_lookup = load_popularity(lambda sql: pd.DataFrame(query(sql, timeout=600)))
+    missing_pop = [c for c in POP_COLS_IN_MODEL if c not in fc._pop(None)]
+    if missing_pop:
+        raise RuntimeError(f"model expects popularity columns we cannot compute: {missing_pop}")
+    print(f"[startup] Popularity loaded: {len(fc.pop_lookup) - 1} products ({time.time() - t_step:.1f}s)", flush=True)
+
+# History is static, so the whole user-history cache is precomputed once (python starter/precompute.py).
+HISTORY_CACHE = "starter/history_cache.pkl"
+if Path(HISTORY_CACHE).exists():
+    t_step = time.time()
+    userFeatures._HIST.update(pickle.load(open(HISTORY_CACHE, "rb")))
+    print(f"[startup] History cache loaded: {len(userFeatures._HIST['users'])} users ({time.time() - t_step:.1f}s)", flush=True)
+else:
+    print("[startup] No history cache found (run precompute.py once): users are fetched in the background", flush=True)
+
+# The cache is never refreshed per user, so mark it valid for any request time.
+# Otherwise fetch_user_history() runs 2 slow RawTree queries whenever a request is newer than the last prefetch.
+userFeatures._HIST["t_max"] = pd.Timestamp("2100-01-01")
 print(f"[startup] Setup complete in {time.time() - t0:.1f}s total.", flush=True)
 
 
@@ -113,13 +159,14 @@ class Stats:
         self.reset()
 
     def reset(self) -> None:
-        self.t: dict[str, float] = defaultdict(float)   # accumulated seconds per stage
+        self.t: dict[str, float] = defaultdict(float)   # accumulated seconds per stage (per answered request)
         self.n = 0                                        # answered (pushed)
         self.dropped = 0                                  # skipped: too old to count
         self.push_failed = 0
         self.versions: Counter = Counter()
         self.age_sum = self.e2e_sum = self.e2e_max = 0.0
-        self.batches = 0
+        self.hist_n = 0                                   # background history fetches
+        self.hist_s = 0.0
 
     def add_time(self, key: str, seconds: float) -> None:
         with self.lock:
@@ -130,12 +177,11 @@ class Stats:
             n = self.n
             if n == 0 and self.dropped == 0:
                 return
-            per_req = " ".join(f"{k}={1000 * v / max(n, 1):.0f}ms" for k, v in self.t.items() if k not in ("prefetch", "user_feat"))
-            per_batch = f"prefetch={1000 * self.t.get('prefetch', 0) / max(self.batches, 1):.0f}ms/batch"
-            user_feat = f"user_feat={1000 * self.t.get('user_feat', 0) / max(n + self.dropped, 1):.0f}ms/req"
+            per_req = " ".join(f"{k}={1000 * v / max(n, 1):.0f}ms" for k, v in self.t.items())
+            hist = f"hist_fetches={self.hist_n} (avg {self.hist_s / max(self.hist_n, 1):.1f}s) pending={len(PENDING)}"
             print(f"[timing] answered={n} dropped_stale={self.dropped} push_failed={self.push_failed} {dict(self.versions)} | "
-                  f"age_at_start avg={self.age_sum / max(n, 1):.2f}s | e2e avg={self.e2e_sum / max(n, 1):.2f}s max={self.e2e_max:.2f}s | "
-                  f"{per_req} | {per_batch} {user_feat}", flush=True)
+                  f"age_at_start avg={self.age_sum / max(n, 1):.2f}s | e2e avg={self.e2e_sum / max(n, 1):.2f}s "
+                  f"max={self.e2e_max:.2f}s | {per_req} | {hist}", flush=True)
             self.reset()
 
 
@@ -165,6 +211,10 @@ def pull(seen: set[str]) -> list[Record]:
     return fresh
 
 
+def _now_utc() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC").tz_localize(None)
+
+
 def _parse_ts(ts_raw) -> pd.Timestamp:
     ts = pd.to_datetime(ts_raw, errors="coerce")
     if pd.notna(ts) and ts.tzinfo is not None:
@@ -175,19 +225,111 @@ def _parse_ts(ts_raw) -> pd.Timestamp:
 def req_age(req: Record) -> float:
     """Seconds since the request was created (our clock vs the shop's UTC timestamp)."""
     ts = _parse_ts(req.get("ts"))
-    return (pd.Timestamp.now(tz="UTC").tz_localize(None) - ts).total_seconds() if pd.notna(ts) else 0.0
+    return (_now_utc() - ts).total_seconds() if pd.notna(ts) else 0.0
+
+
+# ---------- user history cache (userFeatures._HIST) ----------
+PENDING: set[str] = set()                 # users already queued for a background fetch
+PENDING_LOCK = threading.Lock()
+HISTORY_Q: queue.Queue = queue.Queue()
+
+
+def request_history(uid, ts) -> None:
+    """Queue a user for a background history fetch (deduplicated). Their NEXT request will be warm."""
+    uid = str(uid)
+    with PENDING_LOCK:
+        if uid in PENDING:
+            return
+        PENDING.add(uid)
+    HISTORY_Q.put((uid, ts))
+
+
+def history_loop() -> None:
+    """Collects cold users for a moment and fetches them together: 2 queries per group, not 2 per user."""
+    while True:
+        uid, ts = HISTORY_Q.get()
+        batch = {uid: ts}
+        time.sleep(0.2)
+        while True:
+            try:
+                u, t = HISTORY_Q.get_nowait()
+                batch[u] = t
+            except queue.Empty:
+                break
+        valid = [t for t in batch.values() if pd.notna(t)]
+        ts_max = max(valid) if valid else _now_utc()
+        t_start = time.time()
+        try:
+            userFeatures.prefetch(list(batch), ts_max, chunk=WARM_CHUNK, show_progress=False)
+        except Exception as e:
+            print(f"[warn] history fetch failed for {len(batch)} users: {e}", flush=True)
+        finally:
+            with PENDING_LOCK:
+                PENDING.difference_update(batch)
+            with STATS.lock:
+                STATS.hist_n += 1
+                STATS.hist_s += time.time() - t_start
+
+
+def warm_loop() -> None:
+    """Fill the history cache for the most recent distinct users, in the background."""
+    t_start = time.time()
+    try:
+        rows = query(WARM_USERS_SQL.format(n=WARM_USERS), timeout=120)
+    except Exception as e:
+        print(f"[warn] warm-up query failed: {e}", flush=True)
+        return
+    uids = [r["user_id"] for r in rows if r.get("user_id")]
+    if not uids:
+        return
+    ts_max = _parse_ts(max(r["last_ts"] for r in rows))
+    done = 0
+    for i in range(0, len(uids), WARM_CHUNK):
+        if time.time() - t_start > WARM_MAX_S:
+            break
+        chunk = uids[i:i + WARM_CHUNK]
+        try:
+            userFeatures.prefetch(chunk, ts_max, chunk=WARM_CHUNK, show_progress=False)
+            done += len(chunk)
+        except Exception as e:
+            print(f"[warn] warm-up chunk failed: {e}", flush=True)
+    print(f"[warm] cached {done}/{len(uids)} users in {time.time() - t_start:.0f}s", flush=True)
+
+
+@functools.lru_cache(maxsize=512)
+def _defaults_for_hour(hour_ts: pd.Timestamp) -> dict:
+    """User features of someone with no history (only the time-of-day features vary), cached per hour."""
+    no_hist = pd.DataFrame({c: [] for c in ["session_id", "event_type", "product_id", "ts"]})
+    no_sess = pd.DataFrame({c: [] for c in ["request_id", "ts", "context", "clicked", "purchased"]})
+    d = dict(userFeatures.build_user_features(no_hist, no_sess, hour_ts))
+    d["is_new_user"] = 1
+    return d
+
+
+def default_user_data(ts) -> dict:
+    when = ts if pd.notna(ts) else _now_utc()
+    return dict(_defaults_for_hour(when.floor("h")))
+
+
+def user_data_for(req: Record) -> tuple[dict, bool]:
+    """(user features, warm). Never touches the network: a cold user gets new-user defaults and is queued."""
+    uid = req.get("user_id")
+    ts_raw = req.get("ts")
+    ts = _parse_ts(ts_raw)
+    if not uid:
+        return default_user_data(ts), False
+    if str(uid) in userFeatures._HIST["users"]:
+        return userFeatures.user_features(uid, ts_raw) or {}, True
+    request_history(uid, ts)
+    return default_user_data(ts), False
 
 
 def prefetch_users(reqs: list[Record]) -> None:
-    """Download the history of every user in this poll at once (2 queries per poll, not 2 per request)."""
+    """Blocking prefetch for a list of requests (used by --check)."""
     uids = list({r["user_id"] for r in reqs if r.get("user_id")})
-    if not uids:
-        return
-    ts_max = pd.to_datetime([r.get("ts") for r in reqs], errors="coerce").max()
-    try:
+    if uids:
+        ts_max = pd.to_datetime([r.get("ts") for r in reqs], errors="coerce").max()
         userFeatures.prefetch(uids, ts_max, show_progress=False)
-    except Exception as e:
-        print(f"[warn] prefetch failed (falling back to per-user queries): {e}", flush=True)
 
 
 # ---------- candidates + features ----------
@@ -209,29 +351,6 @@ def candidates(recent_views, best, unavailable, n_cv=N_CV, n_total=N_TOTAL) -> l
     return cands
 
 
-def _user_data(req: Record, ts_raw, ts) -> dict:
-    """User features, computed ONCE per request. Anonymous users get the same defaults as in training."""
-    uid = req.get("user_id")
-    if uid:
-        return userFeatures.user_features(uid, ts_raw) or {}
-    no_hist = pd.DataFrame({c: [] for c in ["session_id", "event_type", "product_id", "ts"]})
-    no_sess = pd.DataFrame({c: [] for c in ["request_id", "ts", "context", "clicked", "purchased"]})
-    when = ts if pd.notna(ts) else pd.Timestamp.now(tz="UTC").tz_localize(None)
-    d = dict(userFeatures.build_user_features(no_hist, no_sess, when))
-    d["is_new_user"] = 1
-    return d
-
-
-def safe_user_data(req: Record) -> dict | None:
-    """Run in the poller thread (right after prefetch) so workers never touch userFeatures' shared cache."""
-    try:
-        ts_raw = req.get("ts")
-        return _user_data(req, ts_raw, _parse_ts(ts_raw))
-    except Exception as e:
-        print(f"[warn] user features failed for {req.get('request_id')}: {e}", flush=True)
-        return None
-
-
 def build_frame(cands: list[str], req: Record, deadline: float, user_data: dict | None = None) -> tuple[pd.DataFrame, list[str]]:
     """One DataFrame for all candidates of a request (mirrors the inner loop of generate_xy).
     User and session features are computed once; only item-specific ones per candidate.
@@ -243,8 +362,9 @@ def build_frame(cands: list[str], req: Record, deadline: float, user_data: dict 
     hour = int(ts.hour) if pd.notna(ts) else -1
     dow = int(ts.day_of_week) if pd.notna(ts) else -1
 
-    if user_data is None:
-        user_data = _user_data(req, ts_raw, ts)
+    if user_data is None:                            # --check path: real history (call prefetch_users first)
+        uid = req.get("user_id")
+        user_data = (userFeatures.user_features(uid, ts_raw) or {}) if uid else default_user_data(ts)
     if time.time() > deadline:
         raise TimeoutError("budget exceeded after user features")
     last_meta = fc.catalog_lookup.get(_last_viewed_id(rv)) if rv else None
@@ -275,6 +395,8 @@ def build_frame(cands: list[str], req: Record, deadline: float, user_data: dict 
         }
         X.update(extract_coview_features_from_events(p, rv, COVIEWS))
         X.update(user_data)
+        if POP_COLS_IN_MODEL:
+            X.update(fc._pop(p))
         X.update(_cross_features(user_data, m.get("category"), price))
         rows.append(X)
         kept.append(p)
@@ -288,26 +410,44 @@ def build_frame(cands: list[str], req: Record, deadline: float, user_data: dict 
                 pass
     for c, dt in schema["category_dtypes"].items():
         if c in df.columns:
-            df[c] = df[c].astype(dt)
+            df[c] = pd.Categorical(df[c], categories=dt.categories)
     return df, kept
 
 
 # ---------- answering (runs in worker threads) ----------
-def answer(req: Record, best: list[str], unavailable: set[str], user_data: dict | None) -> Record:
+def _arm(req: Record) -> str:
+    return NOHIST_ARMS[zlib.crc32(str(req["request_id"]).encode()) % len(NOHIST_ARMS)]
+
+
+def answer(req: Record, best: list[str], unavailable: set[str]) -> Record:
     t_start = time.time()
     deadline = t_start + BUDGET_S
     cands = candidates(req.get("recent_views") or [], best, unavailable)
     STATS.add_time("cands", time.time() - t_start)
     try:
         t = time.time()
+        user_data, warm = user_data_for(req)
+        STATS.add_time("user_feat", time.time() - t)
+        if warm and float(user_data.get("is_new_user", 0)) < 0.5:
+            version = "lgbm_v1"                      # user with real history
+        else:
+            arm = _arm(req)
+            version = f"nohist_{arm}"
+            if arm == "cv":                          # candidates() already ranks co-views first, then best sellers
+                return {"request_id": req["request_id"], "items": cands[:10], "model_version": version}
+            if arm == "pop":
+                return {"request_id": req["request_id"],
+                        "items": [p for p in best if p not in unavailable][:10], "model_version": version}
+        t = time.time()
         X, kept = build_frame(cands, req, deadline, user_data)
         STATS.add_time("frame", time.time() - t)
         t = time.time()
         scores = model.predict(X, num_threads=1)     # 1 thread: several workers predict at once
+        if model_buy is not None:
+            scores = scores + BUY_WEIGHT * model_buy.predict(X, num_threads=1)
         STATS.add_time("model", time.time() - t)
         items = [kept[i] for i in np.argsort(-scores)[:10]]
         items += [p for p in cands if p not in items][: 10 - len(items)]   # safety pad
-        version = "lgbm_v1"
     except Exception as e:                           # never leave a request unanswered
         reason = "time budget" if isinstance(e, TimeoutError) else repr(e)
         print(f"[warn] fallback for {req['request_id']}: {reason}", flush=True)
@@ -329,14 +469,14 @@ def push(answers: list[Record]) -> bool:
     return False
 
 
-def handle(req: Record, user_data: dict | None, best: list[str], state: dict) -> None:
+def handle(req: Record, best: list[str], state: dict) -> None:
     try:
         age0 = req_age(req)
         if age0 > START_MAX_AGE_S:                   # already too old to count: don't waste a worker on it
             with STATS.lock:
                 STATS.dropped += 1
             return
-        ans = answer(req, best, state["unavailable"], user_data)
+        ans = answer(req, best, state["unavailable"])
         ok = push([ans])
         e2e = req_age(req)
         with STATS.lock:
@@ -377,6 +517,8 @@ def main() -> None:
     except Exception as e:
         print(f"[warn] initial stock check failed: {e}", flush=True)
     threading.Thread(target=stock_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=history_loop, daemon=True).start()
+    threading.Thread(target=warm_loop, daemon=True).start()
 
     pool = ThreadPoolExecutor(max_workers=WORKERS)
     seen = set[str]()
@@ -386,22 +528,14 @@ def main() -> None:
     while True:
         try:
             fresh = pull(seen)
-            if fresh:
-                t = time.time()
-                prefetch_users(fresh)
-                STATS.add_time("prefetch", time.time() - t)
-                with STATS.lock:
-                    STATS.batches += 1
-                for req in fresh:                    # newest first
-                    t = time.time()
-                    user_data = safe_user_data(req)
-                    STATS.add_time("user_feat", time.time() - t)
-                    pool.submit(handle, req, user_data, best, state)
+            for req in fresh:                        # newest first
+                pool.submit(handle, req, best, state)
             if time.time() - last_log >= LOG_EVERY_S:
                 STATS.log()
                 last_log = time.time()
             elif not fresh and time.time() - last_heartbeat >= 15:
-                print(f"[heartbeat] polling... (seen={len(seen)}, out_of_stock={len(state['unavailable'])})", flush=True)
+                print(f"[heartbeat] polling... (seen={len(seen)}, out_of_stock={len(state['unavailable'])}, "
+                      f"cached_users={len(userFeatures._HIST['users'])})", flush=True)
                 last_heartbeat = time.time()
         except Exception as e:  # keep running: shoppers keep arriving while you sleep
             print(f"[error] {e}", flush=True)

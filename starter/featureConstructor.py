@@ -86,8 +86,10 @@ class FeatureConstructor:
         use_cross_features: bool = True,
         use_ials_features: bool = False,   # score iALS usuario x producto (requiere models/ials_model.npz)
         models_dir: str = None,
+        popularity: dict = None,           # {product_id: {pop_* features}} (ver popularity.load_popularity)
     ):
         self._initialized = False
+        self.pop_lookup = popularity or {}
         self.feature_columns = None     # columnas del modelo (ver set_schema)
         self.category_dtypes = {}       # categorias de entrenamiento (ver set_schema)
         self.column_dtypes = {}         # tipos numericos de entrenamiento (ver set_schema)
@@ -144,6 +146,10 @@ class FeatureConstructor:
             userItemFeatures.load(self.models_dir)
 
         self._initialized = True
+
+    def _pop(self, product_id) -> dict:
+        """Popularidad del producto (o los valores por defecto si no hay estadisticas)."""
+        return dict(self.pop_lookup.get(product_id) or self.pop_lookup.get("__default__") or {})
 
     def constructFeatures(
         self,
@@ -279,6 +285,8 @@ class FeatureConstructor:
             )
         if user_on:
             X = merge(X, user_data)
+        if self.pop_lookup:
+            X.update(self._pop(product_id))
 
         ials_on = self.use_ials_features if use_ials_features is None else use_ials_features
         if ials_on:
@@ -478,6 +486,8 @@ class FeatureConstructor:
                     X.update(extract_coview_features_from_events(prod_id, recent_views, active_coview_dict))
                 if user_on:
                     X.update(user_data)
+                if self.pop_lookup:
+                    X.update(self._pop(prod_id))
 
                 if cross_on and user_on:
                     X.update(_cross_features(user_data, prod_meta.get("category"), price_eur))
